@@ -1,6 +1,15 @@
-CREATE TYPE room_type AS ENUM ('Emergency', 'ICU', 'Ward', 'Normal');
-CREATE TYPE comm_type AS ENUM ('Phone','Email');
+-- Custom types
+DO $$ BEGIN
+    CREATE TYPE room_type AS ENUM ('Emergency', 'ICU', 'Ward', 'Normal');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 
+DO $$ BEGIN
+    CREATE TYPE comm_type AS ENUM ('Phone', 'Email');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+-- Tables
 DROP TABLE IF EXISTS patient_info;
 CREATE TABLE patient_info (
     patient_id BIGSERIAL PRIMARY KEY,
@@ -49,54 +58,75 @@ CREATE TABLE queue (
 	type_of_room room_type 
 );
 
+-- Trigger: release room & doctor when a case is deleted
 CREATE OR REPLACE FUNCTION release_room_and_doctor_status()
-RETURNS TRIGGER AS
-	$$
-	BEGIN
-		UPDATE rooms SET is_occupied = FALSE WHERE room_number = OLD.room_number;
-		UPDATE doctors SET is_busy = FALSE WHERE doctor_id = OLD.doctor_id;
-		RETURN OLD;
-	END;
-	$$ LANGUAGE plpgsql;
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE rooms   SET is_occupied = FALSE WHERE room_number = OLD.room_number;
+    UPDATE doctors SET is_busy = FALSE     WHERE doctor_id   = OLD.doctor_id;
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE TRIGGER release_case_trigger
-	BEFORE DELETE ON ongoing_cases
-	FOR EACH ROW
-	EXECUTE FUNCTION release_room_and_doctor_status();
+DROP TRIGGER IF EXISTS release_case_trigger ON ongoing_cases;
+CREATE TRIGGER release_case_trigger
+    BEFORE DELETE ON ongoing_cases
+    FOR EACH ROW
+    EXECUTE FUNCTION release_room_and_doctor_status();
 
+-- Utility: refresh stale busy flags
 CREATE OR REPLACE FUNCTION refresh_data()
-RETURNS void AS
-	$$
-	BEGIN
-		UPDATE doctors SET is_busy = FALSE,busy_till=NULL,busy_from=NULL WHERE busy_till < CURRENT_TIMESTAMP;
-		
-		UPDATE ongoing_cases SET doctor_id = NULL
-		WHERE doctor_id IN (
-			SELECT doctor_id FROM doctors WHERE is_busy=FALSE
-		);
-		
-		UPDATE rooms SET is_occupied = FALSE
-		WHERE room_number IN (
-			SELECT room_number FROM rooms
-			EXCEPT
-			SELECT DISTINCT room_number FROM ongoing_cases
-		);
-	END;
-	$$ LANGUAGE plpgsql;
+RETURNS void AS $$
+BEGIN
+    UPDATE doctors SET is_busy = FALSE, busy_till = NULL, busy_from = NULL
+    WHERE busy_till < CURRENT_TIMESTAMP;
 
+    UPDATE ongoing_cases SET doctor_id = NULL
+    WHERE doctor_id IN (SELECT doctor_id FROM doctors WHERE is_busy = FALSE);
+
+    UPDATE rooms SET is_occupied = FALSE
+    WHERE room_number IN (
+        SELECT room_number FROM rooms
+        EXCEPT
+        SELECT DISTINCT room_number FROM ongoing_cases
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+-- Lookup: available doctors by specialty
 CREATE OR REPLACE FUNCTION get_available_doctors(spclty VARCHAR)
-	RETURNS SETOF doctors AS
-	$$
-	BEGIN
-		-- SELECT refresh_data();
-		RETURN QUERY SELECT * FROM doctors WHERE specialist = spclty AND is_busy = FALSE;
-	END;
-	$$ LANGUAGE plpgsql;
+RETURNS SETOF doctors AS $$
+BEGIN
+    RETURN QUERY SELECT * FROM doctors WHERE specialist = spclty AND is_busy = FALSE;
+END;
+$$ LANGUAGE plpgsql;
 
+-- Lookup: available rooms by category
 CREATE OR REPLACE FUNCTION get_available_rooms(ctgry room_type)
-	RETURNS SETOF rooms AS
-	$$
-	BEGIN
-		RETURN QUERY SELECT * FROM rooms WHERE rooms.type = ctgry AND is_occupied = FALSE;
-	END;
-	$$ LANGUAGE plpgsql;
+RETURNS SETOF rooms AS $$
+BEGIN
+    RETURN QUERY SELECT * FROM rooms WHERE rooms.type = ctgry AND is_occupied = FALSE;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================================
+-- Seed Data
+-- ============================================================
+
+-- Doctors (matching the 4 departments used in triage)
+INSERT INTO doctors (name, specialist) VALUES
+    ('Dr. Smith',    'Cardiology'),
+    ('Dr. Adams',    'Cardiology'),
+    ('Dr. Jones',    'Pediatrics'),
+    ('Dr. Williams', 'Pediatrics'),
+    ('Dr. Lee',      'Neurology'),
+    ('Dr. Chen',     'Neurology'),
+    ('Dr. Patel',    'Dentist'),
+    ('Dr. Garcia',   'Dentist');
+
+-- Rooms (2 of each type)
+INSERT INTO rooms (room_number, type) VALUES
+    (101, 'ICU'),       (102, 'ICU'),
+    (201, 'Emergency'), (202, 'Emergency'),
+    (301, 'Ward'),      (302, 'Ward'),      (303, 'Ward'),
+    (401, 'Normal'),    (402, 'Normal'),     (403, 'Normal');
